@@ -22,25 +22,7 @@ index d69d43d..652f4db 100644
              if (clock_ticks_ % 10 == 0) {
                  SystemInfo::PrintHeapStats();
              }
-+
-+            // Dotty: proactive WS reconnect on idle-channel timeout.
-+            // IsTimeout() flips at 120 s of silence on the channel, but
-+            // the OS-level TCP teardown can take another ~45 s on top of
-+            // that, leaving the device disconnected and unresponsive to
-+            // walk-up events until a manual nudge re-opens the channel.
-+            // While idle, eagerly close+reopen so the next SendEvent /
-+            // wake-word / listen path finds a live channel waiting.
-+            if (clock_ticks_ % 30 == 0 &&
-+                GetDeviceState() == kDeviceStateIdle &&
-+                protocol_ != nullptr &&
-+                protocol_->IsTimeout()) {
-+                ESP_LOGW(TAG, "Idle channel timeout — proactive close+reopen");
-+                protocol_->CloseAudioChannel();
-+                if (!protocol_->OpenAudioChannel()) {
-+                    ESP_LOGW(TAG, "Idle channel reopen failed; will retry next cycle");
-+                }
-+            }
-         }
+        }
      }
  }
 @@ -507,6 +528,16 @@ void Application::InitializeProtocol() {
@@ -204,6 +186,15 @@ index d69d43d..652f4db 100644
      if (state == kDeviceStateIdle) {
          audio_service_.EncodeWakeWord();
          auto wake_word = audio_service_.GetLastWakeWord();
+@@ -788,7 +852,7 @@ void Application::HandleWakeWordDetectedEvent() {
+ 
++        SetDeviceState(kDeviceStateConnecting);
+         if (!protocol_->IsAudioChannelOpened()) {
+-            SetDeviceState(kDeviceStateConnecting);
+             // Schedule to let the state change be processed first (UI update),
+             // then continue with OpenAudioChannel which may block for ~1 second
+             Schedule([this, wake_word]() {
+                 ContinueWakeWordInvoke(wake_word);
 @@ -861,21 +925,43 @@ void Application::HandleStateChangedEvent() {
      auto led = board.GetLed();
      led->OnStateChanged();
@@ -271,6 +262,15 @@ index d69d43d..652f4db 100644
              display->SetStatus(Lang::Strings::SPEAKING);
  
              if (listening_mode_ != kListeningModeRealtime) {
+@@ -1028,7 +1120,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
+ 
++        SetDeviceState(kDeviceStateConnecting);
+         if (!protocol_->IsAudioChannelOpened()) {
+-            SetDeviceState(kDeviceStateConnecting);
+             // Schedule to let the state change be processed first (UI update)
+             Schedule([this, wake_word]() {
+                 ContinueWakeWordInvoke(wake_word);
+             });
 @@ -1075,6 +1167,63 @@ void Application::SendMcpMessage(const std::string& payload) {
      });
  }

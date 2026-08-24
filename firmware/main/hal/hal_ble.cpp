@@ -208,7 +208,10 @@ private:
         const char* ssid     = data["ssid"];
         const char* password = data["password"];
 
-        mclog::tagInfo(_tag, "get wifi config: {} / {}", ssid, password);
+        // Wi-Fi credentials arrive over the local BLE setup channel. Never
+        // write either value to the serial log: serial captures are commonly
+        // retained for boot diagnostics and would otherwise become secrets.
+        mclog::tagInfo(_tag, "received wifi configuration");
 
         // Notify state: connecting
         notify_state(0, "wifiConnecting");
