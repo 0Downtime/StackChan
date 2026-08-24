@@ -7,11 +7,9 @@
 #include <mooncake_log.h>
 #include <mcp_server.h>
 #include <stackchan/stackchan.h>
-#include <stackchan/privacy/privacy_leds.h>
+#include <stackchan/modes/state_manager.h>
 #include <hal/board/hal_bridge.h>
 #include <apps/common/common.h>
-#include <board.h>          // Board::GetInstance() — privacy LED step 3
-#include <audio_codec.h>     // AudioCodec::input_enabled() — privacy LED step 3
 
 using namespace stackchan;
 
@@ -64,10 +62,10 @@ void Hal::xiaozhi_mcp_init()
 
                            auto& motion = GetStackChan().motion();
                            if (pitch != -9999) {
-                               motion.pitchServo().moveWithSpeed(pitch * 10, speed);
+                               motion.pitchServo().moveWithSpeed(pitch * 10, speed, "mcp_set_head_angles");
                            }
                            if (yaw != -9999) {
-                               motion.yawServo().moveWithSpeed(yaw * 10, speed);
+                               motion.yawServo().moveWithSpeed(yaw * 10, speed, "mcp_set_head_angles");
                            }
 
                            return true;
@@ -76,8 +74,10 @@ void Hal::xiaozhi_mcp_init()
     mclog::tagInfo(_tag, "add robot.set_led_color tool");
     mcp_server.AddTool(
         "self.robot.set_led_color",
-        "Set the color of the robot's INTERNAL onboard LED. This is NOT for room lights. "
-        "Values: 0-168 (safe range). Red=168,0,0; Green=0,168,0; Blue=0,0,168; White=100,100,100; Off=0,0,0.",
+        "Set the colour of the LEFT half of the LED ring (state-arc, 6 pixels). "
+        "The RIGHT half is reserved for owned status indicators (face, kid_mode, "
+        "smart_mode, listening) and is not writable from this tool. Useful for "
+        "chat-driven LED play. Values 0-168 per channel.",
         PropertyList({Property("red", kPropertyTypeInteger, 0, 0, 168),
                       Property("green", kPropertyTypeInteger, 0, 0, 168),
                       Property("blue", kPropertyTypeInteger, 0, 0, 168)}),
@@ -86,12 +86,12 @@ void Hal::xiaozhi_mcp_init()
             int g = properties["green"].value<int>();
             int b = properties["blue"].value<int>();
 
-            mclog::tagInfo(_tag, "set_led_color: r={}, g={}, b={}", r, g, b);
+            mclog::tagInfo(_tag, "set_led_color (left ring only): r={}, g={}, b={}", r, g, b);
 
             LvglLockGuard lock;
 
             GetStackChan().leftNeonLight().setColor(r, g, b);
-            GetStackChan().rightNeonLight().setColor(r, g, b);
+            // Right ring is owned by StateManager — do not write here.
 
             return true;
         });
@@ -99,10 +99,12 @@ void Hal::xiaozhi_mcp_init()
     mclog::tagInfo(_tag, "add robot.set_led_multi tool");
     mcp_server.AddTool(
         "self.robot.set_led_multi",
-        "Set ONE pixel of the robot's 12-LED ring directly. Index 0-5 = left ring, 6-11 = right ring. "
-        "Bypasses the ring colour animation, so the chosen pixel holds its colour while the rest of the "
-        "ring keeps animating (used for hybrid status indicators, e.g. smart-mode). r/g/b 0-255.",
-        PropertyList({Property("index", kPropertyTypeInteger, 0, 0, 11),
+        "Set ONE pixel of the LEFT state-arc ring directly. Index 0-5 = left ring. "
+        "Right-ring indices 6-11 are reserved for owned status indicators "
+        "(face, kid_mode, smart_mode, listening) and cannot be written through "
+        "this tool. Bypasses the ring colour animation, so the chosen pixel holds "
+        "its colour while the rest of the ring keeps animating. r/g/b 0-255.",
+        PropertyList({Property("index", kPropertyTypeInteger, 0, 0, 5),
                       Property("red", kPropertyTypeInteger, 0, 0, 255),
                       Property("green", kPropertyTypeInteger, 0, 0, 255),
                       Property("blue", kPropertyTypeInteger, 0, 0, 255)}),
@@ -112,18 +114,8 @@ void Hal::xiaozhi_mcp_init()
             int g     = properties["green"].value<int>();
             int b     = properties["blue"].value<int>();
 
-            if (index < 0 || index > 11) {
-                mclog::tagWarn(_tag, "set_led_multi: index out of range: {}", index);
-                return false;
-            }
-
-            // These indices are hardware-guaranteed privacy indicators (mic/camera state).
-            // The MCP server-side LLM is NOT trusted with overwriting them. PrivacyLeds::update()
-            // re-asserts every tick (~20ms), so a write here would only cause a transient flicker,
-            // but we reject outright to keep the privacy pixels owned by the peripheral-enable
-            // code path (mic_peripheral_guard / camera_peripheral_guard) alone.
-            if (index == privacy::kMicLedIndex || index == privacy::kCameraLedIndex) {
-                mclog::tagWarn(_tag, "set_led_multi: index reserved for privacy LED: {}", index);
+            if (index < 0 || index > 5) {
+                mclog::tagWarn(_tag, "set_led_multi: index {} not on left ring (0-5); ignoring", index);
                 return false;
             }
 
@@ -131,63 +123,87 @@ void Hal::xiaozhi_mcp_init()
 
             LvglLockGuard lock;
 
-            if (index < 6) {
-                GetStackChan().leftNeonLight().setColorAt(static_cast<uint8_t>(index), r, g, b);
-            } else {
-                GetStackChan().rightNeonLight().setColorAt(static_cast<uint8_t>(index - 6), r, g, b);
-            }
+            GetStackChan().leftNeonLight().setColorAt(static_cast<uint8_t>(index), r, g, b);
 
             return true;
         });
 
-    mclog::tagInfo(_tag, "add robot.get_privacy_state tool");
+    mclog::tagInfo(_tag, "add robot.set_state tool");
     mcp_server.AddTool(
-        "self.robot.get_privacy_state",
-        "READ-ONLY. Returns BOTH the LED intent AND the underlying peripheral truth. "
-        "mic = 'off' | 'local' | 'streaming' (off = mic ADC closed; local = ADC on, only feeding "
-        "wake-word/VAD locally; streaming = ADC on AND opus frames being sent to the server). "
-        "camera = 'off' | 'streaming' (off = no consumer reading frames; streaming = face-detect "
-        "or take_photo is currently dequeuing camera frames). "
-        "mic_peripheral_open = true iff the audio codec input device is currently open. "
-        "camera_peripheral_streaming = true iff the camera driver is in a streamable state "
-        "(placeholder true-always until step 4-5 wires V4L2 truth). "
-        "last_capture_ts_ms = millis-since-boot of the last Capture() call (0 = never). "
-        "This tool CANNOT change the LEDs — they are hardware-tied to the actual peripheral state.",
+        "self.robot.set_state",
+        "Set Dotty's high-level state. Mutually exclusive — exactly one is active. "
+        "Valid: idle, talk, story_time, security, sleep, dance. Paints the state "
+        "arc across left ring 0-5 and selects the idle-motion profile.",
+        PropertyList({Property("state", kPropertyTypeString, std::string("idle"))}),
+        [this](const PropertyList& properties) -> ReturnValue {
+            std::string s = properties["state"].value<std::string>();
+            stackchan::State out;
+            if (!stackchan::StateManager::parseState(s.c_str(), out)) {
+                mclog::tagWarn(_tag, "set_state: unknown state {}", s);
+                return false;
+            }
+            auto* sm = static_cast<stackchan::StateManager*>(
+                GetStackChan().getModifierByName(stackchan::StateManager::kName));
+            if (!sm) {
+                mclog::tagWarn(_tag, "set_state: StateManager not found in modifier pool");
+                return false;
+            }
+            mclog::tagInfo(_tag, "set_state: {}", s);
+            LvglLockGuard lock;
+            sm->setState(out);
+            return true;
+        });
+
+    mclog::tagInfo(_tag, "add robot.set_toggle tool");
+    mcp_server.AddTool(
+        "self.robot.set_toggle",
+        "Set a Dotty toggle on/off. Toggles compose freely with state. "
+        "Valid names: kid_mode (warm pink pip on right ring index 8), "
+        "smart_mode (orange pip on right ring index 9).",
+        PropertyList({Property("name", kPropertyTypeString, std::string("")),
+                      Property("enabled", kPropertyTypeBoolean, false)}),
+        [this](const PropertyList& properties) -> ReturnValue {
+            std::string name = properties["name"].value<std::string>();
+            bool enabled     = properties["enabled"].value<bool>();
+            auto* sm = static_cast<stackchan::StateManager*>(
+                GetStackChan().getModifierByName(stackchan::StateManager::kName));
+            if (!sm) {
+                mclog::tagWarn(_tag, "set_toggle: StateManager not found in modifier pool");
+                return false;
+            }
+            mclog::tagInfo(_tag, "set_toggle: {}={}", name, enabled);
+            LvglLockGuard lock;
+            if (name == "kid_mode") {
+                sm->setKidMode(enabled);
+            } else if (name == "smart_mode") {
+                sm->setSmartMode(enabled);
+            } else {
+                mclog::tagWarn(_tag, "set_toggle: unknown name {}", name);
+                return false;
+            }
+            return true;
+        });
+
+    mclog::tagInfo(_tag, "add robot.set_face_identified tool");
+    mcp_server.AddTool(
+        "self.robot.set_face_identified",
+        "Signal that the currently-detected face has been identified by the "
+        "server-side VLM/roster pipeline. Lights the right-ring face pixel "
+        "(global 6) green for ~4 seconds; refresh by calling again. No-op "
+        "if no face is currently detected. The bridge calls this after a "
+        "successful room-view identification.",
         std::vector<Property>{},
         [this](const PropertyList& properties) -> ReturnValue {
-            const char* mic_str = "off";
-            switch (privacy::PrivacyLeds::getInstance().micState()) {
-                case privacy::MicState::Off:    mic_str = "off"; break;
-                case privacy::MicState::Local:  mic_str = "local"; break;
-                case privacy::MicState::Stream: mic_str = "streaming"; break;
+            auto* sm = static_cast<stackchan::StateManager*>(
+                GetStackChan().getModifierByName(stackchan::StateManager::kName));
+            if (!sm) {
+                mclog::tagWarn(_tag, "set_face_identified: StateManager not found in modifier pool");
+                return false;
             }
-            const char* cam_str = "off";
-            switch (privacy::PrivacyLeds::getInstance().cameraState()) {
-                case privacy::CameraState::Off:    cam_str = "off"; break;
-                case privacy::CameraState::Active: cam_str = "streaming"; break;
-            }
-
-            // Peripheral-level truth. Independent of LED intent so the
-            // bridge can alarm if the two diverge (e.g. STREAMON issued
-            // but ISP still warming after step 4-5 lands).
-            bool mic_open = false;
-            if (auto* codec = Board::GetInstance().GetAudioCodec()) {
-                mic_open = codec->input_enabled();
-            }
-            bool cam_streaming = false;
-            uint32_t last_cap_ms = 0;
-            if (auto* cam = hal_bridge::board_get_camera()) {
-                cam_streaming = cam->isStreaming();
-                last_cap_ms   = cam->lastCaptureTimestampMs();
-            }
-            auto result = fmt::format(
-                R"({{"mic": "{}", "camera": "{}", "mic_peripheral_open": {}, "camera_peripheral_streaming": {}, "last_capture_ts_ms": {}}})",
-                mic_str, cam_str,
-                mic_open ? "true" : "false",
-                cam_streaming ? "true" : "false",
-                last_cap_ms);
-            mclog::tagInfo(_tag, "get_privacy_state: {}", result);
-            return result;
+            mclog::tagInfo(_tag, "set_face_identified");
+            LvglLockGuard lock;
+            sm->setFaceIdentified();
+            return true;
         });
 
     mclog::tagInfo(_tag, "add robot.create_reminder tool");
@@ -244,78 +260,4 @@ void Hal::xiaozhi_mcp_init()
                            tools::stop_reminder(id);
                            return true;
                        });
-
-    // -----------------------------------------------------------------
-    // Layer 4: face-recognition MCP tools (server-side compute, Phase B).
-    // The bridge owns embedding + match; these tools just stream the JPEG
-    // (enroll/recognize) or proxy a request (forget/list). Bridge endpoints
-    // are derived from the existing explain_url_ — see
-    // StackChanCamera::DeriveFaceUrl. Parental gate deferred for v1 per plan.
-    // -----------------------------------------------------------------
-
-    auto* camera = hal_bridge::board_get_camera();
-    if (camera) {
-        mclog::tagInfo(_tag, "add camera.face_enroll tool");
-        mcp_server.AddTool(
-            "self.camera.face_enroll",
-            "Enroll the currently-visible face under `name`. Captures a JPEG and POSTs "
-            "to the bridge /api/face/enroll. Bridge stores the 128-d embedding (not the "
-            "JPEG) in /root/.zeroclaw/faces.sqlite. Capacity 50 enrolled.",
-            PropertyList({Property("name", kPropertyTypeString, std::string(""))}),
-            [camera](const PropertyList& properties) -> ReturnValue {
-                std::string name = properties["name"].value<std::string>();
-                mclog::tagInfo(_tag, "face_enroll: name={}", name);
-                if (name.empty()) {
-                    return std::string(R"({"ok":false,"error":"empty_name"})");
-                }
-                if (!camera->Capture()) {
-                    return std::string(R"({"ok":false,"error":"capture_failed"})");
-                }
-                return camera->EnrollFace(name);
-            });
-
-        mclog::tagInfo(_tag, "add camera.face_recognize tool");
-        mcp_server.AddTool(
-            "self.camera.face_recognize",
-            "Capture a JPEG and ask the bridge who is in frame. Returns the bridge JSON "
-            "response: {ok, name, confidence}. Use after a face_detected event for "
-            "who-is-here lookups; the bridge throttles repeated calls server-side.",
-            std::vector<Property>{},
-            [camera](const PropertyList& properties) -> ReturnValue {
-                mclog::tagInfo(_tag, "face_recognize");
-                if (!camera->Capture()) {
-                    return std::string(R"({"ok":false,"error":"capture_failed"})");
-                }
-                return camera->RecognizeFace();
-            });
-
-        mclog::tagInfo(_tag, "add camera.face_forget tool");
-        mcp_server.AddTool(
-            "self.camera.face_forget",
-            "Delete the enrollment for `name` from the bridge. Pass name='*' to wipe "
-            "ALL enrollments. No on-device parental gate in v1 (family-only "
-            "deployment); re-enable before any wider deployment.",
-            PropertyList({Property("name", kPropertyTypeString, std::string(""))}),
-            [camera](const PropertyList& properties) -> ReturnValue {
-                std::string name = properties["name"].value<std::string>();
-                mclog::tagInfo(_tag, "face_forget: name={}", name);
-                if (name.empty()) {
-                    return std::string(R"({"ok":false,"error":"empty_name"})");
-                }
-                return camera->ForgetFace(name);
-            });
-
-        mclog::tagInfo(_tag, "add camera.face_list tool");
-        mcp_server.AddTool(
-            "self.camera.face_list",
-            "List all enrolled faces from the bridge. Returns {ok, names, count, "
-            "capacity}. Read-only — only names cross the wire, never embeddings.",
-            std::vector<Property>{},
-            [camera](const PropertyList& properties) -> ReturnValue {
-                mclog::tagInfo(_tag, "face_list");
-                return camera->ListFaces();
-            });
-    } else {
-        mclog::tagWarn(_tag, "camera unavailable — face_* MCP tools not registered");
-    }
 }

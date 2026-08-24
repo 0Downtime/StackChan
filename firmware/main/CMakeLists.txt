@@ -15,6 +15,13 @@ file(GLOB_RECURSE STACK_CHAN_SOURCES
     "stackchan/*.cc"
     "stackchan/*.cpp"
 )
+# NOTE: CONFIGURE_DEPENDS is intentionally OFF here. ESP-IDF evaluates
+# component CMakeLists.txt in script mode during the requirements phase
+# (component_get_requirements.cmake), and CONFIGURE_DEPENDS is rejected
+# in script mode ("CONFIGURE_DEPENDS is invalid for script and find
+# package modes"). The only safe workflow when adding a brand-new .cpp
+# file under main/ is `idf.py reconfigure && idf.py build` so the GLOB
+# re-runs at configure time. See dotty-flash-firmware build-errors.md.
 set(STACK_CHAN_INCLUDE_DIRS 
     "."
 )

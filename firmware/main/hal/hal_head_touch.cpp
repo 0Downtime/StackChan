@@ -17,8 +17,16 @@ enum class TouchState { IDLE, TOUCHED, SWIPING };
 
 // 配置参数
 struct TouchConfig {
-    uint8_t touch_threshold = 1;
+    // Require SI12T_OUTPUT_HIGH — threshold=2 (MID) still let through events
+    // where channel 2 + a neighbour both spiked to MID for ≥150 ms with no one
+    // touching the device. HP-PROBE traces (2026-04-28) caught two such fires
+    // at i=[1,2,2] and i=[0,2,1]. Bumping to 3 demands the firmest reading.
+    uint8_t touch_threshold = 3;
     int16_t swipe_threshold = 40;  // 使用百分比，范围-100到100
+    // Consecutive 50 ms samples of `is_touched()` required before we accept
+    // the IDLE→TOUCHED transition. Filters sub-150 ms capacitive blips
+    // (RF/EMI/proximity drift) without making deliberate pets feel laggy.
+    uint8_t debounce_samples = 3;
 };
 
 // 触摸数据
@@ -44,9 +52,9 @@ struct TouchData {
         return max_val;
     }
 
-    bool is_touched() const
+    bool is_touched(uint8_t threshold) const
     {
-        return get_max_intensity() >= 1;
+        return get_max_intensity() >= threshold;
     }
 };
 
@@ -61,21 +69,30 @@ public:
     HeadPetGesture update(const TouchData& data)
     {
         HeadPetGesture gesture = HeadPetGesture::None;
+        const bool touched = data.is_touched(config.touch_threshold);
 
         switch (current_state) {
             case TouchState::IDLE:
-                if (data.is_touched()) {
-                    current_state    = TouchState::TOUCHED;
-                    initial_position = data.get_position();
-                    gesture          = HeadPetGesture::Press;
-                    // mclog::tagInfo(_tag, "Touch detected at position: {}", initial_position);
+                if (touched) {
+                    if (touched_samples < config.debounce_samples) {
+                        ++touched_samples;
+                    }
+                    if (touched_samples >= config.debounce_samples) {
+                        current_state    = TouchState::TOUCHED;
+                        initial_position = data.get_position();
+                        gesture          = HeadPetGesture::Press;
+                        // mclog::tagInfo(_tag, "Touch detected at position: {}", initial_position);
+                    }
+                } else {
+                    touched_samples = 0;
                 }
                 break;
 
             case TouchState::TOUCHED:
-                if (!data.is_touched()) {
-                    current_state = TouchState::IDLE;
-                    gesture       = HeadPetGesture::Release;
+                if (!touched) {
+                    current_state   = TouchState::IDLE;
+                    touched_samples = 0;
+                    gesture         = HeadPetGesture::Release;
                 } else {
                     // Check for swipe
                     int16_t current_pos = data.get_position();
@@ -94,9 +111,10 @@ public:
                 break;
 
             case TouchState::SWIPING:
-                if (!data.is_touched()) {
-                    current_state = TouchState::IDLE;
-                    gesture       = HeadPetGesture::Release;
+                if (!touched) {
+                    current_state   = TouchState::IDLE;
+                    touched_samples = 0;
+                    gesture         = HeadPetGesture::Release;
                 }
                 break;
         }
@@ -113,6 +131,7 @@ private:
     TouchConfig config;
     TouchState current_state;
     int16_t initial_position;
+    uint8_t touched_samples = 0;
 };
 
 static void _head_touch_update_task(void* param)

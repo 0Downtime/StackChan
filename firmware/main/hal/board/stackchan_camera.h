@@ -20,8 +20,8 @@ struct JpegChunk {
     size_t len;
 };
 
-namespace stackchan::privacy {
-class CameraPeripheralGuard;
+namespace stackchan::camera {
+class CameraStreamGuard;
 }
 
 class StackChanCamera : public Camera {
@@ -49,22 +49,18 @@ private:
     std::string explain_token_;
     std::thread encoder_thread_;
 
-    // Privacy LED step 3: peripheral-level truth surfaced via MCP
-    // get_privacy_state. Updated at the top of Capture(); 0 means "no
-    // photo since boot". Wraps every ~49 days (uint32_t millis) — fine.
+    // Wall-time of the last Capture() call (ms since boot; 0 = never).
+    // Wraps every ~49 days (uint32_t millis) — fine.
     uint32_t last_capture_ts_ms_ = 0;
 
-    // Phase B (face recognition) helpers. Multipart streamer factored out
-    // of Explain() so the face_enroll/face_recognize tools can reuse it.
+    // Multipart streamer used by Explain() to POST a JPEG to the bridge's
+    // /api/vision/explain endpoint (room_view / VLM identification path).
     std::string StreamJpegToBridge(
         const std::string& url, const std::string& token,
         const std::vector<std::pair<std::string, std::string>>& extra_fields);
-    std::string DeriveFaceUrl(const std::string& verb) const;
-    std::string SimpleBridgeRequest(const std::string& method, const std::string& url,
-                                    const std::string& content_type, const std::string& body);
 
-    // Privacy LED steps 4-5 lifecycle. Reachable only through the friend
-    // CameraPeripheralGuard refcount — the only path that should toggle
+    // V4L2 stream lifecycle. Reachable only through the friend
+    // CameraStreamGuard refcount — the only path that should toggle
     // V4L2 stream state. startStreaming() may block up to 5 s for ISP
     // autoexposure warmup on first call; subsequent calls are cheap and
     // return early when streaming_on_ is already true. stopStreaming()
@@ -72,7 +68,7 @@ private:
     // guard refcount honest — diagnostics surface via streaming_on_.
     bool startStreaming();
     void stopStreaming();
-    friend class stackchan::privacy::CameraPeripheralGuard;
+    friend class stackchan::camera::CameraStreamGuard;
 
 public:
     StackChanCamera(const esp_video_init_config_t& config);
@@ -87,16 +83,9 @@ public:
     virtual bool SetVFlip(bool enabled) override;
     virtual std::string Explain(const std::string& question);
 
-    // Layer 4 face recognition (server-side). All four go to the bridge
-    // at the URL derived from explain_url_ — see DeriveFaceUrl().
-    virtual std::string EnrollFace(const std::string& name);
-    virtual std::string RecognizeFace();
-    virtual std::string ForgetFace(const std::string& name);
-    virtual std::string ListFaces();
-
-    // Privacy LED step 3 accessors. isStreaming() is a placeholder that
-    // returns true unconditionally; step 4-5 (the camera lifecycle
-    // refactor) will replace it with the real V4L2 stream state.
+    // True iff V4L2 streaming is currently asserted (between
+    // VIDIOC_STREAMON and VIDIOC_STREAMOFF). Tracks the actual driver
+    // state, not the refcount.
     bool isStreaming() const;
     uint32_t lastCaptureTimestampMs() const
     {

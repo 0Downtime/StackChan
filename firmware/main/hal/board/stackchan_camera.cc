@@ -17,7 +17,34 @@
 #include "display.h"
 #include "stackchan_camera.h"
 #include <stackchan/face/camera_arbiter.h>
-#include <stackchan/privacy/camera_peripheral_guard.h>
+#include <stackchan/camera/camera_stream_guard.h>
+#include <stackchan/stackchan.h>
+
+// V4L2 ioctl macro encoding fix. lwip's sockets.h (pulled in transitively by
+// stackchan.h -> ... -> lwip/sockets.h) redefines _IO / _IOR / _IOW with the
+// BSD encoding (IOC_OUT | IOCPARM_MASK | ...), overriding esp_video's
+// linux/ioctl.h Linux encoding. linux/ioctl.h uses #pragma once, so simply
+// reordering the videodev2.h include doesn't restore the Linux versions.
+//
+// The esp_video dispatcher (esp_video_ioctl.c, separate TU, no lwip pull-in)
+// keeps its case-constants Linux-encoded, so a BSD-expanded VIDIOC_QUERYCAP
+// here would never match -> dispatcher returns ESP_ERR_INVALID_ARG -> errno=22
+// EINVAL on every camera ioctl. Symptom: "VIDIOC_QUERYCAP failed errno=22"
+// at boot, "CameraStreamGuard: startStreaming failed", FaceDetector spinning
+// on "StreamCaptures failed", phase0 fps=0.
+//
+// Force the Linux encoding back into scope. The underlying _IOC machinery
+// (_IOC, _IOC_NONE, _IOC_READ, _IOC_WRITE, _IOC_TYPECHECK) is not redefined
+// by lwip and is still Linux-flavoured here.
+#undef _IO
+#undef _IOR
+#undef _IOW
+#undef _IOWR
+#define _IO(type,nr)        _IOC(_IOC_NONE,(type),(nr),0)
+#define _IOR(type,nr,size)  _IOC(_IOC_READ,(type),(nr),(_IOC_TYPECHECK(size)))
+#define _IOW(type,nr,size)  _IOC(_IOC_WRITE,(type),(nr),(_IOC_TYPECHECK(size)))
+#define _IOWR(type,nr,size) _IOC(_IOC_READ|_IOC_WRITE,(type),(nr),(_IOC_TYPECHECK(size)))
+
 #include "esp_jpeg_common.h"
 #include "jpg/image_to_jpeg.h"
 #include "jpg/jpeg_to_image.h"
@@ -326,11 +353,10 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
         }
     }
 
-    // Privacy LED step 4: do NOT issue VIDIOC_STREAMON here. The
-    // CameraPeripheralGuard (face detector enable, MCP take_photo, etc.)
-    // is now the only path that turns the V4L2 stream on. The camera is
-    // initialised but quiescent until a consumer needs it; the red
-    // privacy LED then becomes a true peripheral indicator.
+    // Do NOT issue VIDIOC_STREAMON here. CameraStreamGuard (face detector
+    // enable, MCP take_photo, etc.) is the only path that brings the V4L2
+    // stream up. The camera is initialised but quiescent until a consumer
+    // needs it.
     ESP_LOGI(TAG, "Camera init success (stream off; awaiting first guard)");
 }
 
@@ -385,13 +411,22 @@ bool StackChanCamera::Capture()
         ~ArbiterGuard() { a.releaseForCapture(); }
     } arbiter_guard{arbiter};
 
-    // Layer 1 privacy LED + V4L2 stream lifecycle. The refcounted guard
-    // brings the stream up on the 0→1 transition (synchronous; blocks
-    // ~5 s on first acquire after boot for ISP autoexposure warmup) and
-    // tears it down on 1→0. Composes with the FaceDetector guard so two
-    // simultaneous consumers keep the stream and LED steady across the
-    // overlap.
-    stackchan::privacy::CameraPeripheralGuard camera_privacy_guard;
+    // Freeze head servos for the duration of the still capture so face-
+    // tracking, idle-motion, and IMU reactions don't move the head mid-
+    // shutter. Cooperative gate — the modifiers check isModifyLocked()
+    // each tick. Avatar (blink/expression) is intentionally left alive.
+    struct MotionPauseGuard {
+        stackchan::motion::Motion& m;
+        MotionPauseGuard(stackchan::motion::Motion& motion) : m(motion) { m.setModifyLock(true); }
+        ~MotionPauseGuard() { m.setModifyLock(false); }
+    } motion_pause_guard{ ::GetStackChan().motion() };
+
+    // V4L2 stream lifecycle. The refcounted guard brings the stream up
+    // on the 0→1 transition (synchronous; blocks ~5 s on first acquire
+    // after boot for ISP autoexposure warmup) and tears it down on 1→0.
+    // Composes with the FaceDetector guard so two simultaneous consumers
+    // keep the stream up across the overlap.
+    stackchan::camera::CameraStreamGuard camera_stream_guard;
     if (!streaming_on_) {
         // startStreaming() failed inside the guard ctor (logged there).
         // The guard dtor will still flip the LED back off when this
@@ -852,7 +887,7 @@ bool StackChanCamera::Capture()
 bool StackChanCamera::isStreaming() const
 {
     // V4L2 truth, flipped by startStreaming()/stopStreaming(). The
-    // refcounted CameraPeripheralGuard is the only legitimate caller of
+    // refcounted CameraStreamGuard is the only legitimate caller of
     // those, so this tracks the actual VIDIOC_STREAMON state.
     return streaming_on_;
 }
@@ -936,13 +971,6 @@ bool StackChanCamera::StreamCaptures()
     if (!streaming_on_ || video_fd_ < 0) {
         return false;
     }
-
-    // Privacy LED guard moved up to FaceDetector::processFrame() so it
-    // wraps both the StreamCaptures() capture step (~50 ms) AND the
-    // ESP-DL inference (~280 ms). The previous per-StreamCaptures scope
-    // visibly blinked the red privacy LED at the inference cadence
-    // (capture-on, inference-off, capture-on, ...). Step 4-5 replaces
-    // both with a refcounted CameraPeripheralGuard tied to STREAMON.
 
     {
         struct v4l2_buffer buf = {};
@@ -1250,103 +1278,3 @@ std::string StackChanCamera::StreamJpegToBridge(
     return result;
 }
 
-std::string StackChanCamera::DeriveFaceUrl(const std::string& verb) const
-{
-    // explain_url_ is configured once at startup as ".../api/vision/explain".
-    // Swap the suffix to derive ".../api/face/<verb>".
-    static const std::string kSuffix = "/api/vision/explain";
-    if (explain_url_.size() < kSuffix.size() ||
-        explain_url_.compare(explain_url_.size() - kSuffix.size(),
-                             kSuffix.size(), kSuffix) != 0) {
-        ESP_LOGW(TAG, "explain_url_ does not end in %s — cannot derive face URL",
-                 kSuffix.c_str());
-        return std::string();
-    }
-    return explain_url_.substr(0, explain_url_.size() - kSuffix.size())
-           + "/api/face/" + verb;
-}
-
-std::string StackChanCamera::SimpleBridgeRequest(
-    const std::string& method, const std::string& url,
-    const std::string& content_type, const std::string& body)
-{
-    if (url.empty()) {
-        throw std::runtime_error("Bridge URL is not set");
-    }
-    auto network = Board::GetInstance().GetNetwork();
-    auto http    = network->CreateHttp(3);
-
-    http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
-    http->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
-    if (!explain_token_.empty()) {
-        http->SetHeader("Authorization", "Bearer " + explain_token_);
-    }
-    if (!content_type.empty()) {
-        http->SetHeader("Content-Type", content_type);
-    }
-    if (!body.empty()) {
-        std::string body_copy = body;
-        http->SetContent(std::move(body_copy));
-    }
-    if (!http->Open(method, url)) {
-        ESP_LOGE(TAG, "Failed to open bridge URL: %s", url.c_str());
-        throw std::runtime_error("Failed to open bridge URL");
-    }
-
-    int status         = http->GetStatusCode();
-    std::string result = http->ReadAll();
-    http->Close();
-
-    if (status != 200) {
-        ESP_LOGE(TAG, "Bridge request failed, status=%d url=%s body=%s",
-                 status, url.c_str(), result.c_str());
-        throw std::runtime_error("Bridge request failed");
-    }
-    ESP_LOGI(TAG, "SimpleBridgeRequest %s %s -> %s",
-             method.c_str(), url.c_str(), result.c_str());
-    return result;
-}
-
-std::string StackChanCamera::EnrollFace(const std::string& name)
-{
-    std::string url = DeriveFaceUrl("enroll");
-    if (url.empty()) {
-        throw std::runtime_error("face URL not configured");
-    }
-    return StreamJpegToBridge(url, explain_token_, {{"name", name}});
-}
-
-std::string StackChanCamera::RecognizeFace()
-{
-    std::string url = DeriveFaceUrl("recognize");
-    if (url.empty()) {
-        throw std::runtime_error("face URL not configured");
-    }
-    return StreamJpegToBridge(url, explain_token_, {});
-}
-
-std::string StackChanCamera::ForgetFace(const std::string& name)
-{
-    std::string url = DeriveFaceUrl("forget");
-    if (url.empty()) {
-        throw std::runtime_error("face URL not configured");
-    }
-    // JSON body matches bridge contract: {"name": "..."} or {"name": "*"} for wipe-all.
-    // Names validated upstream; here only escape " and \.
-    std::string escaped;
-    for (char c : name) {
-        if (c == '"' || c == '\\') escaped.push_back('\\');
-        escaped.push_back(c);
-    }
-    std::string body = "{\"name\":\"" + escaped + "\"}";
-    return SimpleBridgeRequest("POST", url, "application/json", body);
-}
-
-std::string StackChanCamera::ListFaces()
-{
-    std::string url = DeriveFaceUrl("list");
-    if (url.empty()) {
-        throw std::runtime_error("face URL not configured");
-    }
-    return SimpleBridgeRequest("GET", url, "", "");
-}

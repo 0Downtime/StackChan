@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "head_pet.h"
+#include "../stackchan.h"             // Phase 5: ::GetStackChan() for state lookup
 #include "../utils/random.h"
+#include "../modes/state_manager.h"   // Phase 5: head-pet wakes from SLEEP
 #include "application.h"  // perception events + WakeWordInvoke
 #include <smooth_ui_toolkit.hpp>
 #include <memory>
@@ -51,6 +53,12 @@ void HeadPetModifier::_update(Modifiable& stackchan)
         _hold_wake_fired  = false;
         _touch_start_ms   = now;
         Application::GetInstance().SendEvent("head_pet_started", "{}");
+        // Phase 5 — wake from SLEEP on capacitive touch. StateManager gates
+        // on current state internally; outside SLEEP this is a no-op.
+        if (auto* sm = static_cast<StateManager*>(
+                ::GetStackChan().getModifierByName(StateManager::kName))) {
+            sm->onHeadPet();
+        }
     }
 
     // Affect: handle "being petted" (swipe gestures fire while held).
@@ -124,7 +132,7 @@ void HeadPetModifier::restore_original_state(Modifiable& stackchan)
     }
 
     stackchan.avatar().setEmotion(_prev_emotion);
-    stackchan.motion().moveWithSpeed(_prev_yaw, _prev_pitch, 200);
+    stackchan.motion().moveWithSpeed(_prev_yaw, _prev_pitch, 200, "head_pet_restore");
 
     _in_happy_state = false;
 }
@@ -159,16 +167,16 @@ void HeadPetModifier::perform_pet_motion(Modifiable& stackchan)
     target_pitch = uitk::clamp(target_pitch, 0, 540);
     target_yaw   = uitk::clamp(target_yaw, -512, 512);
 
-    motion.moveWithSpeed(target_yaw, target_pitch, speed);
+    motion.moveWithSpeed(target_yaw, target_pitch, speed, "head_pet_perform");
 }
 
 void HeadPetModifier::flashWakeFeedback(Modifiable& stackchan)
 {
-    // Same green as FaceTrackingModifier::setTrackingLed — single source of
-    // visual truth for "device is now in a listen-y state". One frame is
-    // enough; the listen-state LED policy in stackchan_display will repaint
-    // immediately when the WS transitions to Listening.
-    stackchan.leftNeonLight().setColor(0, 168, 0);
+    // The state arc on the left ring is owned by StateManager — head-pet
+    // wake feedback is conveyed by the avatar (sleepy → neutral) and the
+    // wake-tilt motion. No LED flash needed; an unannounced clobber would
+    // fight StateManager's 5 Hz re-assert anyway.
+    (void)stackchan;
 }
 
 }  // namespace stackchan

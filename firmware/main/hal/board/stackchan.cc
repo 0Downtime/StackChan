@@ -18,6 +18,7 @@
 #include <esp_timer.h>
 #include "stackchan_camera.h"
 #include "hal_bridge.h"
+#include "hal/hal.h"
 
 #define TAG "M5Stack-StackChan-Board"
 
@@ -67,7 +68,41 @@ public:
             ESP_LOGI(TAG, "Set charge current success");
         }
 
+        // Enable PKEY long-press IRQ. Per XPowersLib AXP2101 enum, PKEY events
+        // pack into bits 8-11 of a 24-bit IRQ value, i.e. byte 1 — registers
+        // INTEN2 (0x41) / INTSTS2 (0x49). Long-press is bit 2 of that byte.
+        // Reg 0x27 left at default 0x00 → bits[5:4]=0 (IRQ at 1s),
+        // bits[3:2]=0 (AXP hardware-off at 4s), giving ~3s of headroom for
+        // firmware cleanup before the chip self-cuts the rail.
+        uint8_t irq_en_2 = ReadReg(0x41);
+        WriteReg(0x41, irq_en_2 | 0x04);
+        // Clear any stale PKEY status so a freshly-booted board doesn't see a
+        // ghost long-press from the boot button hold itself.
+        WriteReg(0x49, 0xFF);
+
         SetBrightness(0);
+    }
+
+    // Returns true once per long-press event. Clears the PKEY long-press flag
+    // (W1C) so subsequent polls only fire on new presses.
+    bool ConsumePekLongPress()
+    {
+        uint8_t status = ReadReg(0x49);
+        if (status & 0x04) {
+            WriteReg(0x49, 0x04);
+            return true;
+        }
+        return false;
+    }
+
+    bool IsExternalPowerConnected()
+    {
+        const uint8_t power_status      = ReadReg(0x01);
+        const uint8_t current_direction = (power_status & 0b01100000) >> 5;
+        const bool is_charging_done     = (power_status & 0b00000111) == 0b00000100;
+        // Treat any non-discharging state as externally powered so a plugged-in
+        // cable still counts even after the battery is full.
+        return current_direction != 2 || is_charging_done;
     }
 
     void SetBrightness(uint8_t brightness)
@@ -188,8 +223,17 @@ public:
         uint8_t reg = 0x02;
         esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, read_buffer_, 6, 100);
         if (err != ESP_OK) {
+            consecutive_failures_++;
+            const int64_t now_us = esp_timer_get_time();
+            if (last_error_log_us_ == 0 || (now_us - last_error_log_us_) >= 1'000'000) {
+                ESP_LOGW(TAG, "FT6336 read failed (%s), skipped %lu sample(s)",
+                         esp_err_to_name(err),
+                         static_cast<unsigned long>(consecutive_failures_));
+                last_error_log_us_ = now_us;
+            }
             return;
         }
+        consecutive_failures_ = 0;
         tp_.num = read_buffer_[0] & 0x0F;
         tp_.x   = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
         tp_.y   = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
@@ -201,8 +245,10 @@ public:
     }
 
 private:
-    uint8_t* read_buffer_ = nullptr;
+    uint8_t* read_buffer_          = nullptr;
     TouchPoint_t tp_;
+    int64_t last_error_log_us_     = 0;
+    uint32_t consecutive_failures_ = 0;
 };
 
 class M5StackCoreS3Board : public WifiBoard {
@@ -214,7 +260,46 @@ private:
     LvglDisplay* display_;
     StackChanCamera* camera_;
     esp_timer_handle_t touchpad_timer_;
+    esp_timer_handle_t pek_poll_timer_;
     PowerSaveTimer* power_save_timer_;
+
+    // Shared cleanup path for both idle-shutdown and long-press shutdown.
+    // PY32 IO expander stays powered after AXP cuts the system rail, so its
+    // last-written LED state would otherwise persist and silently drain the
+    // battery. Clear all 12 pixels and drop servo power before PowerOff().
+    void PrepareForPowerOff()
+    {
+        GetHAL().showRgbColor(0, 0, 0);
+        GetHAL().setServoPowerEnabled(false);
+    }
+
+    void PollPowerKey()
+    {
+        if (pmic_->ConsumePekLongPress()) {
+            ESP_LOGW(TAG, "PEK long-press detected; cleaning up before AXP self-off");
+            PrepareForPowerOff();
+            pmic_->PowerOff();
+        }
+    }
+
+    void InitializePekPollTimer()
+    {
+        esp_timer_create_args_t timer_args = {
+            .callback =
+                [](void* arg) {
+                    M5StackCoreS3Board* board = (M5StackCoreS3Board*)arg;
+                    board->PollPowerKey();
+                },
+            .arg                   = this,
+            .dispatch_method       = ESP_TIMER_TASK,
+            .name                  = "pek_poll_timer",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &pek_poll_timer_));
+        // 200 ms tick gives ~3 polls between PEK long-press IRQ (1s) and AXP
+        // hardware-off (4s) — comfortable headroom for I2C round-trips + LED clear.
+        ESP_ERROR_CHECK(esp_timer_start_periodic(pek_poll_timer_, 200 * 1000));
+    }
 
     void InitializePowerSaveTimer()
     {
@@ -227,7 +312,10 @@ private:
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
-        power_save_timer_->OnShutdownRequest([this]() { pmic_->PowerOff(); });
+        power_save_timer_->OnShutdownRequest([this]() {
+            PrepareForPowerOff();
+            pmic_->PowerOff();
+        });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -418,6 +506,7 @@ public:
         InitializePowerSaveTimer();
         InitializeI2c();
         InitializeAxp2101();
+        InitializePekPollTimer();
         InitializeAw9523();
         I2cDetect();
         InitializeSpi();

@@ -5,7 +5,7 @@
  */
 #include "hal.h"
 #include <stackchan/stackchan.h>
-#include <stackchan/privacy/camera_peripheral_guard.h>
+#include <stackchan/camera/camera_stream_guard.h>
 #include <memory>
 #include "board/hal_bridge.h"
 #include <mooncake.h>
@@ -56,6 +56,11 @@ public:
         DanceSequence     = 0x14,
         StartAudioStream  = 0x18,
         StopAudioStream   = 0x19,
+        // 0x1A — was the bridge-driven privacy LED pulse signal
+        // (mic WAN-bound / camera uploading). Privacy LED semantics were
+        // dropped in 2026-04-27; the bridge no longer sends this. The
+        // value is reserved so the protocol numbering stays stable.
+        Privacy           = 0x1A,
     };
 
     struct ReceivedMessage {
@@ -210,14 +215,13 @@ public:
                 // }
                 case DataType::StartCameraStream: {
                     ESP_LOGI(_tag.c_str(), "Start Camera Stream");
-                    GetHAL().setCameraLedActive(true);
-                    // Privacy LED step 4: hold a CameraPeripheralGuard
-                    // for the entire avatar-stream lifetime. This brings
-                    // the V4L2 stream up via the same refcount path as
-                    // FaceDetector / Capture, so simultaneous consumers
-                    // keep the stream alive without churn.
+                    // Hold a CameraStreamGuard for the entire avatar-
+                    // stream lifetime. This brings the V4L2 stream up
+                    // via the same refcount path as FaceDetector /
+                    // Capture, so simultaneous consumers keep the stream
+                    // alive without churn.
                     if (!_camera_guard) {
-                        _camera_guard = std::make_unique<stackchan::privacy::CameraPeripheralGuard>();
+                        _camera_guard = std::make_unique<stackchan::camera::CameraStreamGuard>();
                     }
                     setStreamingEnabled(true);
                     _websocket->Send("camera stream started");
@@ -225,7 +229,6 @@ public:
                 }
                 case DataType::StopCameraStream: {
                     ESP_LOGI(_tag.c_str(), "Stop Camera Stream");
-                    GetHAL().setCameraLedActive(false);
                     setStreamingEnabled(false);
                     _camera_guard.reset();
                     _websocket->Send("camera stream stopped");
@@ -375,6 +378,10 @@ public:
                 case DataType::StopAudioStream: {
                     break;
                 }
+                // DataType::Privacy was the bridge-driven privacy LED
+                // pulse hook (mic WAN-bound / camera uploading). Privacy
+                // LED semantics were dropped in 2026-04-27 — see
+                // docs/modes.md. The bridge no longer sends this packet.
                 default:
                     break;
             }
@@ -447,9 +454,8 @@ private:
     bool _is_video_mode              = false;
     // Held while the WS peer has the avatar camera stream open. Refcount
     // composes with FaceDetector + Capture guards so the V4L2 stream
-    // stays up across all consumers and the privacy LED tracks "any
-    // consumer is reading frames" rather than any single code path.
-    std::unique_ptr<stackchan::privacy::CameraPeripheralGuard> _camera_guard;
+    // stays up across all consumers.
+    std::unique_ptr<stackchan::camera::CameraStreamGuard> _camera_guard;
     std::mutex _mutex;
     std::queue<ReceivedMessage> _msg_queue;
 
